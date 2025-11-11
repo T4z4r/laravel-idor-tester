@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import csv
+import sys
+import time
+import threading
+from typing import List, Dict, Any, Optional
+import requests
+from tqdm import tqdm
+import yaml
+from colorama import init, Fore
+
+init(autoreset=True)
+
+# -------------------------------------------------------------
+# Helper: deep JSON diff (ignores specified paths)
+# -------------------------------------------------------------
+def json_diff(a: dict, b: dict, ignore: List[str]) -> bool:
+    for field in ignore:
+        for obj in (a, b):
+            keys = field.split('.')
+            parent = obj
+            for k in keys[:-1]:
+                parent = parent.setdefault(k, {})
+            parent.pop(keys[-1], None)
+
+    return a != b
+
+# -------------------------------------------------------------
+# IDOR Tester Class
+# -------------------------------------------------------------
+class LaravelIDORTester:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.session = requests.Session()
+        self.findings = []
+        self.lock = threading.Lock()
+
+        # Setup auth
+        auth = config.get('auth', {})
+        auth_type = auth.get('type', 'none').lower()
+        if auth_type == 'bearer' and auth.get('token'):
+            self.session.headers['Authorization'] = f"Bearer {auth['token']}"
+        elif auth_type == 'cookie' and auth.get('cookie'):
+            self.session.cookies.set('cookie', auth['cookie'], domain=None)
+        elif auth_type == 'header' and auth.get('header'):
+            k, v = auth['header'].split(':', 1)
+            self.session.headers[k.strip()] = v.strip()
+
+        # Target
+        self.url_template = config['target']['url_template']
+        self.method = config['target'].get('method', 'GET').upper()
+        self.data_template = config['target'].get('data_template')
+
+        # Scan params
+        scan = config['scan']
+        self.id_type = scan.get('id_type', 'numeric')
+        self.numeric_range = scan.get('numeric_range', [1, 100])
+        self.wordlist = self.load_wordlist(scan.get('wordlist_file'))
+        self.threads = scan.get('threads', 5)
+        self.delay = scan.get('delay', 0)
+
+        # Diff
+        diff_cfg = config.get('diff', {})
+        self.baseline_id = str(diff_cfg.get('baseline_id'))
+        self.ignore_fields = diff_cfg.get('ignore_fields', [])
+        self.baseline_resp = None
+
+        # Output
+        out = config.get('output', {})
+        self.out_format = out.get('format', 'console')
+        self.out_file = out.get('file')
+
+    # ---------------------------------------------------------
+    def load_wordlist(self, path: Optional[str]) -> List[str]:
+        if not path:
+            return []
+        try:
+            with open(path) as f:
+                return [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            print(f"{Fore.RED}[!] Failed to load wordlist: {e}")
+            return []
+
+    # ---------------------------------------------------------
+    def make_request(self, id_val: str) -> Optional[Dict[str, Any]]:
+        url = self.url_template.replace("{id}", id_val)
+        try:
+            if self.method == "GET":
+                r = self.session.get(url, timeout=10)
+            elif self.method == "POST" and self.data_template:
+                data = json.loads(self.data_template.replace("{id}", id_val))
+                r = self.session.post(url, json=data, timeout=10)
+            else:
+                r = self.session.request(self.method, url, timeout=10)
+
+            if r.headers.get('Content-Type', '').startswith('application/json'):
+                try:
+                    return {"id": id_val, "status": r.status_code, "json": r.json(), "url": url}
+                except:
+                    return {"id": id_val, "status": r.status_code, "text": r.text, "url": url}
+            else:
+                return {"id": id_val, "status": r.status_code, "text": r.text, "url": url}
+        except Exception as e:
+            return {"id": id_val, "error": str(e), "url": url}
+
+    # ---------------------------------------------------------
+    def fetch_baseline(self):
+        print(f"{Fore.CYAN}[*] Fetching baseline response (ID={self.baseline_id})...")
+        self.baseline_resp = self.make_request(self.baseline_id)
+        if not self.baseline_resp:
+            print(f"{Fore.RED}[!] Baseline request failed.")
+            sys.exit(1)
+        print(f"{Fore.GREEN}[+] Baseline status: {self.baseline_resp.get('status')}")
+
+    # ---------------------------------------------------------
+    def worker(self, id_queue, pbar):
+        while True:
+            try:
+                id_val = id_queue.get_nowait()
+            except:
+                break
+
+            resp = self.make_request(id_val)
+            if resp:
+                # Compare with baseline
+                if self.baseline_resp and 'json' in resp and 'json' in self.baseline_resp:
+                    if json_diff(resp['json'], self.baseline_resp['json'], self.ignore_fields):
+                        with self.lock:
+                            self.findings.append(resp)
+                            pbar.write(f"{Fore.YELLOW}[!] IDOR? ID={id_val} → {resp['status']}")
+                elif resp.get('status') != self.baseline_resp.get('status'):
+                    # Status code differs
+                    with self.lock:
+                        self.findings.append(resp)
+                        pbar.write(f"{Fore.YELLOW}[!] Status diff ID={id_val}: {resp['status']}")
+
+            time.sleep(self.delay)
+            id_queue.task_done()
+            pbar.update(1)
+
+    # ---------------------------------------------------------
+    def run(self):
+        self.fetch_baseline()
+
+        from queue import Queue
+        id_queue = Queue()
+        ids_to_test = []
+
+        if self.id_type in ('numeric', 'both'):
+            start, end = self.numeric_range
+            ids_to_test.extend(str(i) for i in range(start, end + 1))
+
+        if self.id_type in ('wordlist', 'both') and self.wordlist:
+            ids_to_test.extend(self.wordlist)
+
+        ids_to_test = [i for i in ids_to_test if i != self.baseline_id]  # skip baseline
+        for id_val in ids_to_test:
+            id_queue.put(id_val)
+
+        print(f"{Fore.CYAN}[*] Starting scan of {len(ids_to_test)} IDs with {self.threads} threads...")
+        pbar = tqdm(total=len(ids_to_test), desc="Scanning", unit="id")
+
+        threads = []
+        for _ in range(self.threads):
+            t = threading.Thread(target=self.worker, args=(id_queue, pbar))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+
+        id_queue.join()
+        pbar.close()
+
+        for t in threads:
+            t.join()
+
+        self.report()
+
+    # ---------------------------------------------------------
+    def report(self):
+        if not self.findings:
+            print(f"{Fore.GREEN}[+] No IDOR-like responses found.")
+            return
+
+        print(f"\n{Fore.RED}[!] {len(self.findings)} potential IDORs detected!\n")
+
+        if self.out_format == 'console':
+            for f in self.findings:
+                print(f"ID: {f['id']} | Status: {f.get('status')} | URL: {f['url']}")
+                if 'json' in f:
+                    print(json.dumps(f['json'], indent=2)[:500] + "...")
+                print("-" * 60)
+
+        elif self.out_format == 'json' and self.out_file:
+            with open(self.out_file, 'w') as fp:
+                json.dump(self.findings, fp, indent=2)
+            print(f"{Fore.GREEN}[+] Report saved to {self.out_file}")
+
+        elif self.out_format == 'csv' and self.out_file:
+            keys = ['id', 'status', 'url']
+            with open(self.out_file, 'w', newline='') as fp:
+                writer = csv.DictWriter(fp, fieldnames=keys + ['json_preview'])
+                writer.writeheader()
+                for f in self.findings:
+                    row = {k: f.get(k, '') for k in keys}
+                    row['json_preview'] = json.dumps(f.get('json', {}))[:200]
+                    writer.writerow(row)
+            print(f"{Fore.GREEN}[+] CSV report saved to {self.out_file}")
+
+# -------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Laravel IDOR Tester")
+    parser.add_argument('--config', type=str, help='Path to YAML config')
+    parser.add_argument('--url', type=str, help='URL template with {id}')
+    parser.add_argument('--method', type=str, default='GET')
+    parser.add_argument('--token', type=str, help='Bearer token')
+    parser.add_argument('--range', nargs=2, type=int, metavar=('START', 'END'), help='Numeric range')
+    parser.add_argument('--wordlist', type=str, help='Wordlist file')
+    parser.add_argument('--baseline', type=str, help='Your own ID for diff')
+    parser.add_argument('--threads', type=int, default=10)
+    parser.add_argument('--output', type=str, help='Output file (json/csv)')
+    parser.add_argument('--format', type=str, choices=['json','csv','console'], default='console')
+
+    args = parser.parse_args()
+
+    if args.config:
+        with open(args.config) as f:
+            config = yaml.safe_load(f)
+    else:
+        # Build minimal config from CLI
+        if not args.url:
+            print(f"{Fore.RED}[!] --url is required if no --config")
+            sys.exit(1)
+        config = {
+            'target': {'url_template': args.url, 'method': args.method},
+            'auth': {'type': 'bearer', 'token': args.token} if args.token else {'type': 'none'},
+            'scan': {
+                'id_type': 'numeric' if args.range else 'wordlist',
+                'numeric_range': args.range or [1, 100],
+                'wordlist_file': args.wordlist,
+                'threads': args.threads
+            },
+            'diff': {'baseline_id': args.baseline},
+            'output': {'format': args.format, 'file': args.output}
+        }
+
+    tester = LaravelIDORTester(config)
+    tester.run()
+
+if __name__ == "__main__":
+    main()
