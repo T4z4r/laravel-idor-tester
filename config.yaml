@@ -1,0 +1,29 @@
+target:
+  url_template: "https://example.com/api/posts/{id}"
+  method: GET
+  # or POST with data_template:
+  # data_template: '{"post_id": "{id}"}'
+
+auth:
+  type: bearer          # cookie | bearer | header | none
+  token: "your-jwt-or-session-token"
+  # cookie: "laravel_session=abc123"
+  # header: "X-API-Key: xyz"
+
+scan:
+  id_type: numeric      # numeric | wordlist | both
+  numeric_range: [1, 5000]
+  wordlist_file: wordlist.txt
+  threads: 10
+  delay: 0.1            # seconds between requests per thread
+
+diff:
+  baseline_id: 1        # ID you *own* (to compare responses)
+  ignore_fields:        # JSON paths to ignore when diffing
+    - "updated_at"
+    - "created_at"
+    - "token"
+
+output:
+  format: json          # json | csv | console
+  file: idor_report.json
